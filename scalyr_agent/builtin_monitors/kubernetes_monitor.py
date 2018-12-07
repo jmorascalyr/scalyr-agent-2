@@ -131,6 +131,11 @@ define_config_option( __monitor__, 'k8s_ignore_namespaces',
                       'Optional (defaults to "kube-system"). A comma-delimited list of the namespaces whose pods\'s '
                       'logs should not be collected and sent to Scalyr.', convert_to=str, default="kube-system")
 
+define_config_option( __monitor__, 'k8s_ignore_pod_sandboxes',
+                      'Optional (defaults to True). If True then all containers with the label '
+                      '`io.kubernetes.docker.type` equal to `podsandbox` are excluded from the'
+                      'logs being collected', convert_to=bool, default=True)
+
 define_config_option( __monitor__, 'k8s_include_all_containers',
                       'Optional (defaults to True). If True, all containers in all pods will be monitored by the kubernetes monitor '
                       'unless they have an include: false or exclude: true annotation. '
@@ -375,7 +380,7 @@ _global_container_tracer = scalyr_logging.DebugTracer(global_log, 'debug_k8s(get
 
 def _get_containers(client, ignore_container=None, restrict_to_container=None, logger=None,
                     only_running_containers=True, running_or_created_after=None, glob_list=None, include_log_path=False, k8s_cache=None,
-                    k8s_include_by_default=True, k8s_namespaces_to_exclude=None, current_time=None,
+                    k8s_include_by_default=True, k8s_namespaces_to_exclude=None, ignore_pod_sandboxes=True, current_time=None,
                     debug_k8s=False, debug_tracer=None):
     """Queries the Docker API and returns a dict of running containers that maps container id to container name, and other info
         @param client: A docker.Client object
@@ -392,6 +397,7 @@ def _get_containers(client, ignore_container=None, restrict_to_container=None, l
         @param k8s_include_by_default: Boolean.  If True, then all k8s containers are included by default, unless an include/exclude annotation excludes them.
             If False, then all k8s containers are excluded by default, unless an include/exclude annotation includes them.
         @param k8s_namespaces_to_exclude: List  The of namespaces whose containers should be excluded.
+        @param ignore_pod_sandboxes: Boolean.  If True then any k8s pod sandbox containers are ignored from the list of monitored containers
         @param current_time.  Timestamp since the epoch
     """
     if logger is None:
@@ -440,6 +446,14 @@ def _get_containers(client, ignore_container=None, restrict_to_container=None, l
                 debug_tracer.debug('Further processing in _get_containers')
                 name = container['Names'][0].lstrip('/')
 
+                # ignore any pod sandbox containers
+                if ignore_pod_sandboxes:
+                    container_type = container.get( 'Labels', {} ).get( 'io.kubernetes.docker.type', '' )
+                    if container_type == 'podsandbox':
+                        if debug_k8s:
+                            global_log.info('debug_k8s: cid=%s ignored podsandbox container' % cid)
+                        continue
+
                 add_container = True
 
                 if glob_list:
@@ -457,6 +471,7 @@ def _get_containers(client, ignore_container=None, restrict_to_container=None, l
                         try:
                             debug_tracer.debug('Inspecting cid=%s' % cid)
                             info = client.inspect_container( cid )
+
                             debug_tracer.debug('Done inspecting cid=%s' % cid)
                             log_path = info['LogPath'] if include_log_path and 'LogPath' in info else None
 
@@ -541,7 +556,8 @@ class ContainerChecker( StoppableThread ):
     """
 
     def __init__( self, config, logger, socket_file, docker_api_version, host_hostname, data_path, log_path,
-                  include_all, include_deployment_info, include_daemonsets_as_deployments, namespaces_to_ignore ):
+                  include_all, include_deployment_info, include_daemonsets_as_deployments, namespaces_to_ignore,
+                  ignore_pod_sandboxes ):
 
         self._config = config
         self._logger = logger
@@ -573,6 +589,8 @@ class ContainerChecker( StoppableThread ):
 
         # The namespace whose logs we should not collect.
         self.__namespaces_to_ignore = namespaces_to_ignore
+
+        self.__ignore_pod_sandboxes = ignore_pod_sandboxes
 
         # This is currently an experimental feature.  Including deployment information for every event uploaded about
         # a pod (cluster name, deployment name, deployment labels)
@@ -774,6 +792,7 @@ class ContainerChecker( StoppableThread ):
         prev_digests = {}
         base_attributes = self.__get_base_attributes()
         previous_time = time.time()
+        cache_pause = 'check_containers'
 
         while run_state.is_running():
             try:
@@ -784,8 +803,11 @@ class ContainerChecker( StoppableThread ):
                                       'include_by_default=%s' % (previous_time, self.__list_to_str(self.__glob_list),
                                                                  self.__list_to_str(self.__namespaces_to_ignore),
                                                                  str(self.__include_all)))
-
                 current_time = time.time()
+
+                if self.k8s_cache:
+                    self.k8s_cache.pause( key=cache_pause, update_if_expired=True, current_time=current_time, debug_tracer=self._k8s_debug )
+
                 running_containers = _get_containers(
                     self.__client, ignore_container=self.container_id, running_or_created_after=previous_time,
                     glob_list=self.__glob_list, include_log_path=True, k8s_cache=self.k8s_cache,
@@ -875,6 +897,8 @@ class ContainerChecker( StoppableThread ):
 
             except Exception, e:
                 self._logger.warn( "Exception occurred when checking containers %s\n%s" % (str( e ), traceback.format_exc()) )
+            if self.k8s_cache:
+                self.k8s_cache.unpause( key=cache_pause, debug_tracer=self._k8s_debug )
 
             self._k8s_debug.stop()
             run_state.sleep_but_awaken_if_stopped( self.__delay )
@@ -1622,6 +1646,7 @@ class KubernetesMonitor( ScalyrMonitor ):
         for x in self._config.get('k8s_ignore_namespaces').split():
             self.__namespaces_to_ignore.append(x.strip())
 
+        self.__ignore_pod_sandboxes = self._config.get('k8s_ignore_pod_sandboxes')
         self.__socket_file = self.__get_socket_file()
         self.__docker_api_version = self._config.get( 'docker_api_version' )
 
@@ -1649,7 +1674,7 @@ class KubernetesMonitor( ScalyrMonitor ):
             self.__container_checker = ContainerChecker( self._config, self._logger, self.__socket_file,
                                                          self.__docker_api_version, host_hostname, data_path, log_path,
                                                          self.__include_all, self.__include_deployment_info, self.__include_daemonsets_as_deployments,
-                                                         self.__namespaces_to_ignore)
+                                                         self.__namespaces_to_ignore, self.__ignore_pod_sandboxes )
 
         # Metrics provided by the kubelet API.
         self.__k8s_pod_network_metrics = {
@@ -2023,82 +2048,95 @@ class KubernetesMonitor( ScalyrMonitor ):
         tracer.start()
         tracer.debug('Entering sample with interval of %d ' % self._sample_interval_secs)
 
+
         k8s_cache = None
         if self.__container_checker:
             k8s_cache = self.__container_checker.k8s_cache
 
-        cluster_name = None
-        if k8s_cache is not None:
-            cluster_name = k8s_cache.get_cluster_name()
-
-        tracer.debug('About to report')
-        # gather metrics
-        containers = None
-        if self.__report_container_metrics:
-            tracer.debug('Retrieving containers')
-            containers = _get_containers(self.__client, ignore_container=None, glob_list=self.__glob_list,
-                                         k8s_cache=k8s_cache, k8s_include_by_default=self.__include_all,
-                                         k8s_namespaces_to_exclude=self.__namespaces_to_ignore, debug_tracer=tracer)
-            if tracer.is_tracing():
-                if containers is not None:
-                    tracer.debug('Found x containers for metrics %d' % len(containers))
-                    for cid in containers.keys():
-                        tracer.debug('Reporting metrics for %s' % cid)
-                else:
-                    tracer.debug('Did not find containers for metrics')
+        cache_pause = "gather_sample"
+        if k8s_cache:
+            k8s_cache.pause( key=cache_pause, update_if_expired=True )
 
         try:
-            if containers:
-                if self.__report_container_metrics:
-                    self._logger.log(scalyr_logging.DEBUG_LEVEL_3, 'Attempting to retrieve metrics for %d containers' % len(containers))
-                    self.__gather_metrics_from_api( containers, k8s_cache, cluster_name )
 
-                if self.__report_k8s_metrics:
-                    self._logger.log(scalyr_logging.DEBUG_LEVEL_3, 'Attempting to retrieve k8s metrics %d' % len(containers))
-                    self.__gather_k8s_metrics_from_kubelet( containers, self.__kubelet_api, k8s_cache, cluster_name )
-        except Exception, e:
-            self._logger.exception( "Unexpected error logging metrics: %s" %( str(e) ) )
+            cluster_name = None
+            if k8s_cache is not None:
+                cluster_name = k8s_cache.get_cluster_name()
 
-        if self.__gather_k8s_pod_info:
-            tracer.debug('Gathering pod info')
-            cluster_info = self.__get_cluster_info( cluster_name )
+            tracer.debug('About to report')
+            # gather metrics
+            containers = None
+            if self.__report_container_metrics:
+                tracer.debug('Retrieving containers')
+                containers = _get_containers(self.__client, ignore_container=None, glob_list=self.__glob_list,
+                                             k8s_cache=k8s_cache, k8s_include_by_default=self.__include_all,
+                                             k8s_namespaces_to_exclude=self.__namespaces_to_ignore, debug_tracer=tracer)
+                if tracer.is_tracing():
+                    if containers is not None:
+                        tracer.debug('Found x containers for metrics %d' % len(containers))
+                        for cid in containers.keys():
+                            tracer.debug('Reporting metrics for %s' % cid)
+                    else:
+                        tracer.debug('Did not find containers for metrics')
 
-            containers = _get_containers( self.__client, only_running_containers=False, k8s_cache=k8s_cache,
-                                          k8s_include_by_default=self.__include_all,
-                                          k8s_namespaces_to_exclude=self.__namespaces_to_ignore, debug_tracer=tracer)
-            for cid, info in containers.iteritems():
-                try:
-                    extra = info.get( 'k8s_info', {} )
-                    extra['status'] = info.get('status', 'unknown')
-                    if self.__include_deployment_info:
-                        deployment = self.__get_k8s_deployment_info( info, k8s_cache )
-                        extra.update( deployment )
-                        extra.update( cluster_info )
+            try:
+                if containers:
+                    if self.__report_container_metrics:
+                        self._logger.log(scalyr_logging.DEBUG_LEVEL_3, 'Attempting to retrieve metrics for %d containers' % len(containers))
+                        self.__gather_metrics_from_api( containers, k8s_cache, cluster_name )
 
-                    namespace = extra.get( 'pod_namespace', 'invalid-namespace' )
-                    self._logger.emit_value( 'docker.container_name', info['name'], extra, monitor_id_override="namespace:%s" % namespace )
-                except Exception, e:
-                    self._logger.error( "Error logging container information for %s: %s" % (_get_short_cid( cid ), str( e )) )
+                    if self.__report_k8s_metrics:
+                        self._logger.log(scalyr_logging.DEBUG_LEVEL_3, 'Attempting to retrieve k8s metrics %d' % len(containers))
+                        self.__gather_k8s_metrics_from_kubelet( containers, self.__kubelet_api, k8s_cache, cluster_name )
+            except Exception, e:
+                self._logger.exception( "Unexpected error logging metrics: %s" %( str(e) ) )
 
-            if self.__container_checker:
-                namespaces = self.__container_checker.get_k8s_data()
-                for namespace, pods in namespaces.iteritems():
-                    for pod_name, pod in pods.iteritems():
-                        try:
-                            extra = { 'pod_uid': pod.uid,
-                                      'pod_namespace': pod.namespace,
-                                      'node_name': pod.node_name }
+            if self.__gather_k8s_pod_info:
+                tracer.debug('Gathering pod info')
+                cluster_info = self.__get_cluster_info( cluster_name )
 
-                            if self.__include_deployment_info:
-                                deployment_info = self.__build_k8s_deployment_info( k8s_cache, pod )
-                                if deployment_info:
-                                    extra.update( deployment_info )
-                                extra.update( cluster_info )
+                containers = _get_containers( self.__client, only_running_containers=False, k8s_cache=k8s_cache,
+                                              k8s_include_by_default=self.__include_all,
+                                              k8s_namespaces_to_exclude=self.__namespaces_to_ignore, debug_tracer=tracer)
+                for cid, info in containers.iteritems():
+                    try:
+                        extra = info.get( 'k8s_info', {} )
+                        extra['status'] = info.get('status', 'unknown')
+                        if self.__include_deployment_info:
+                            deployment = self.__get_k8s_deployment_info( info, k8s_cache )
+                            extra.update( deployment )
+                            extra.update( cluster_info )
 
-                            self._logger.emit_value( 'k8s.pod', pod.name, extra, monitor_id_override="namespace:%s" % pod.namespace )
-                        except Exception, e:
-                            self._logger.error( "Error logging pod information for %s: %s" % (pod.name, str( e )) )
+                        namespace = extra.get( 'pod_namespace', 'invalid-namespace' )
+                        self._logger.emit_value( 'docker.container_name', info['name'], extra, monitor_id_override="namespace:%s" % namespace )
+                    except Exception, e:
+                        self._logger.error( "Error logging container information for %s: %s" % (_get_short_cid( cid ), str( e )) )
+
+                if self.__container_checker:
+                    namespaces = self.__container_checker.get_k8s_data()
+                    for namespace, pods in namespaces.iteritems():
+                        for pod_name, pod in pods.iteritems():
+                            try:
+                                extra = { 'pod_uid': pod.uid,
+                                          'pod_namespace': pod.namespace,
+                                          'node_name': pod.node_name }
+
+                                if self.__include_deployment_info:
+                                    deployment_info = self.__build_k8s_deployment_info( k8s_cache, pod )
+                                    if deployment_info:
+                                        extra.update( deployment_info )
+                                    extra.update( cluster_info )
+
+                                self._logger.emit_value( 'k8s.pod', pod.name, extra, monitor_id_override="namespace:%s" % pod.namespace )
+                            except Exception, e:
+                                self._logger.error( "Error logging pod information for %s: %s" % (pod.name, str( e )) )
+        finally:
+            if k8s_cache:
+                k8s_cache.unpause( key=cache_pause, debug_tracer=tracer )
+
+        tracer.debug('gather_sample complete')
         tracer.stop()
+
 
 
     def run( self ):
